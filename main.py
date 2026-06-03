@@ -2,6 +2,7 @@ import os
 import re
 import telebot
 from telebot import types
+from telebot.handler_backends import CancelUpdate
 import sqlite3
 from flask import Flask
 import threading
@@ -37,59 +38,68 @@ _raw_ids = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS_LIST: list = [int(x.strip()) for x in _raw_ids.split(",") if x.strip().isdigit()]
 ADMIN_ID = ADMIN_IDS_LIST[0] if ADMIN_IDS_LIST else 0
 
+telebot.apihelper.ENABLE_MIDDLEWARE = True
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
 # ==================== ГЛОБАЛЬНЫЕ СОСТОЯНИЯ ====================
-active_lobbies   = {}   # {lobby_id: lobby_dict}   — ожидающие/не начатые
-running_matches  = {}   # {lobby_id: lobby_dict}   — активные матчи (перенесены из active_lobbies)
-user_lobby       = {}   # {uid: lobby_id}
-lobby_player_messages = {}   # {lobby_id: {uid: (chat_id, msg_id)}}
-ban_status_messages   = {}   # {lobby_id: {uid: (chat_id, msg_id)}}
-user_flow        = {}
-awaiting_screenshot = {}
-rename_flow      = {}
-parties          = {}
-user_party       = {}
-admin_action     = {}
-match_registration = {}
+maintenance_mode      = False          # Технические работы
+active_lobbies        = {}
+running_matches       = {}
+user_lobby            = {}
+lobby_player_messages = {}
+ban_status_messages   = {}
+ban_turn_messages     = {}      # {lobby_id: (chat_id, msg_id)}
+accept_status_messages= {}      # {lobby_id: {uid: (chat_id, msg_id)}}
+match_found_messages  = {}      # {lobby_id: {uid: (chat_id, msg_id)}}
+user_flow             = {}
+awaiting_screenshot   = {}
+rename_flow           = {}
+parties               = {}
+user_party            = {}
+admin_action          = {}
+match_registration    = {}
 awaiting_party_invite = {}
-change_flow      = {}   # {uid: {"field": "nick"|"game_id"|"admin_nick"|"admin_id", ...}}
+change_flow           = {}
+editstat_flow         = {}      # {uid: {"field": ..., "target_id": ...}}
+promo_flow            = {}      # {uid: True}  — ждём ввода промокода
+promo_admin_flow      = {}      # {uid: {step, data}}
 
 # ==================== БАЗА ДАННЫХ ====================
 DB = "faceit.db"
 
 SHOP_ITEMS_DEFAULT = [
-    ("AK-47 | Fuel Injector", "Легендарный скин на АК-47", "skins", 500, "skin"),
-    ("AK-47 | Bloodsport", "Агрессивный дизайн", "skins", 350, "skin"),
-    ("M4A4 | Howl", "Редкий скин M4A4", "skins", 800, "skin"),
-    ("M4A4 | Neo-Noir", "Элегантный скин M4A4", "skins", 400, "skin"),
-    ("AWP | Dragon Lore", "Легендарный AWP", "skins", 1200, "skin"),
-    ("AWP | Asiimov", "Футуристичный AWP", "skins", 600, "skin"),
-    ("Нож | Butterfly Blue", "Красивый нож-бабочка", "skins", 1500, "skin"),
-    ("Нож | Karambit Fade", "Редкий карамбит", "skins", 2000, "skin"),
-    ("Рамка Gold", "Золотая рамка профиля", "decor", 300, "frame"),
-    ("Рамка Diamond", "Алмазная рамка профиля", "decor", 600, "frame"),
-    ("Рамка Elite", "Элитная рамка профиля", "decor", 150, "frame"),
-    ("Стикер 🔥", "Огненный стикер", "decor", 50, "sticker"),
-    ("Стикер 💀", "Стикер черепа", "decor", 50, "sticker"),
-    ("Стикер ⚡", "Стикер молнии", "decor", 50, "sticker"),
-    ("Анимация Победа", "Анимация при победе", "decor", 400, "animation"),
-    ("Анимация Убийство", "Анимация при убийстве", "decor", 400, "animation"),
-    ("Premium статус", "30 дней Premium: x1.5 монет, значок ★", "goods", 1000, "premium"),
-    ("x2 монеты", "Удвоение монет за 7 дней", "goods", 500, "x2coins"),
-    ("Снятие варна", "Снять 1 предупреждение", "goods", 200, "unwarn"),
-    ("Смена ника", "Изменить ник в боте", "goods", 100, "rename"),
-    ("Quals доступ", "Постоянный доступ к QUALS лиге", "goods", 3000, "quals"),
+    ("AK-47 | Fuel Injector",  "Легендарный скин на АК-47", "skins", 500,  "skin"),
+    ("AK-47 | Bloodsport",     "Агрессивный дизайн",        "skins", 350,  "skin"),
+    ("M4A4 | Howl",            "Редкий скин M4A4",           "skins", 800,  "skin"),
+    ("M4A4 | Neo-Noir",        "Элегантный скин M4A4",       "skins", 400,  "skin"),
+    ("AWP | Dragon Lore",      "Легендарный AWP",            "skins", 1200, "skin"),
+    ("AWP | Asiimov",          "Футуристичный AWP",          "skins", 600,  "skin"),
+    ("Нож | Butterfly Blue",   "Красивый нож-бабочка",       "skins", 1500, "skin"),
+    ("Нож | Karambit Fade",    "Редкий карамбит",            "skins", 2000, "skin"),
+    ("Рамка Gold",             "Золотая рамка профиля",      "decor", 300,  "frame"),
+    ("Рамка Diamond",          "Алмазная рамка профиля",     "decor", 600,  "frame"),
+    ("Рамка Elite",            "Элитная рамка профиля",      "decor", 150,  "frame"),
+    ("Стикер 🔥",              "Огненный стикер",            "decor", 50,   "sticker"),
+    ("Стикер 💀",              "Стикер черепа",              "decor", 50,   "sticker"),
+    ("Стикер ⚡",              "Стикер молнии",              "decor", 50,   "sticker"),
+    ("Анимация Победа",        "Анимация при победе",        "decor", 400,  "animation"),
+    ("Анимация Убийство",      "Анимация при убийстве",      "decor", 400,  "animation"),
+    ("Premium статус",         "30 дней Premium: x1.5 монет, значок 👑", "goods", 1000, "premium"),
+    ("x2 монеты",              "Удвоение монет за 7 дней",   "goods", 300,  "x2coins"),
+    ("Снятие варна",           "Снять 1 предупреждение",     "goods", 150,  "unwarn"),
+    ("Смена ника",             "Изменить ник в боте",        "goods", 10,   "rename"),
+    ("Quals доступ",           "Постоянный доступ к QUALS",  "goods", 1500, "quals"),
 ]
 
 CATEGORY_NAMES = {"skins": "🎨 Скины", "decor": "🖼 Декор", "goods": "📦 Товары"}
 CATEGORY_ICONS = {"skins": "🎨", "decor": "🖼", "goods": "📦"}
 
 COIN_PACKAGES = [
-    ("Стартовый",   200,  50,  "~50₽"),
-    ("Оптимальный", 600,  130, "~130₽"),
-    ("Выгодный",    2000, 400, "~400₽"),
-    ("Мега",        5000, 900, "~900₽"),
+    ("Стартовый",   200,   40,   "40 ⭐"),
+    ("Оптимальный", 600,   100,  "100 ⭐"),
+    ("Выгодный",    2000,  300,  "300 ⭐"),
+    ("Мега",        5000,  750,  "750 ⭐"),
+    ("Элита",       70000, 1200, "1200 ⭐"),
 ]
 
 
@@ -137,15 +147,15 @@ def init_db():
         )
     """)
     for col, definition in [
-        ("is_banned",     "INTEGER DEFAULT 0"),
-        ("warns",         "INTEGER DEFAULT 0"),
-        ("quals_access",  "INTEGER DEFAULT 0"),
-        ("is_game_reg",   "INTEGER DEFAULT 0"),
-        ("is_muted",      "INTEGER DEFAULT 0"),
-        ("mute_until",    "INTEGER DEFAULT 0"),
-        ("is_on_check",   "INTEGER DEFAULT 0"),
-        ("check_admin_id","INTEGER DEFAULT 0"),
-        ("tg_username",   "TEXT DEFAULT ''"),
+        ("is_banned",      "INTEGER DEFAULT 0"),
+        ("warns",          "INTEGER DEFAULT 0"),
+        ("quals_access",   "INTEGER DEFAULT 0"),
+        ("is_game_reg",    "INTEGER DEFAULT 0"),
+        ("is_muted",       "INTEGER DEFAULT 0"),
+        ("mute_until",     "INTEGER DEFAULT 0"),
+        ("is_on_check",    "INTEGER DEFAULT 0"),
+        ("check_admin_id", "INTEGER DEFAULT 0"),
+        ("tg_username",    "TEXT DEFAULT ''"),
     ]:
         try:
             cur.execute(f"ALTER TABLE players ADD COLUMN {col} {definition}")
@@ -182,6 +192,17 @@ def init_db():
             "INSERT INTO shop_items (name, description, category, price, item_type) VALUES (?,?,?,?,?)",
             SHOP_ITEMS_DEFAULT,
         )
+    else:
+        # Обновляем цены при каждом запуске бота
+        price_updates = [
+            (1000, "premium"),
+            (300,  "x2coins"),
+            (150,  "unwarn"),
+            (10,   "rename"),
+            (1500, "quals"),
+        ]
+        for price, item_type in price_updates:
+            cur.execute("UPDATE shop_items SET price=? WHERE item_type=?", (price, item_type))
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
@@ -210,6 +231,28 @@ def init_db():
             finished_at INTEGER DEFAULT (strftime('%s','now')), players_json TEXT
         )
     """)
+
+    # Промокоды
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            reward_type TEXT NOT NULL,
+            reward_value INTEGER DEFAULT 0,
+            max_uses INTEGER DEFAULT 1,
+            uses INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            created_at INTEGER DEFAULT (strftime('%s','now'))
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS promo_uses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            code TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
     print("✅ БД инициализирована.")
@@ -219,12 +262,10 @@ def init_db():
 def _db():
     return sqlite3.connect(DB)
 
-
 def get_player(user_id):
     conn = _db(); cur = conn.cursor()
     cur.execute("SELECT * FROM players WHERE user_id=?", (user_id,))
     row = cur.fetchone(); conn.close(); return row
-
 
 def is_registered(uid):
     p = get_player(uid); return p is not None and p[12] == 1
@@ -263,7 +304,7 @@ def is_on_check_db(uid):
 def get_check_admin(uid):
     p = get_player(uid)
     if p is None or len(p) <= 21: return None
-    return p[21]  # check_admin_id
+    return p[21]
 
 def has_quals_access(uid):
     if is_admin(uid): return True
@@ -359,6 +400,64 @@ def get_match_history(limit=10):
     cur.execute("SELECT match_id, league, device, map_name, winner, score_w, score_l, finished_at FROM matches ORDER BY finished_at DESC LIMIT ?", (limit,))
     rows = cur.fetchall(); conn.close(); return rows
 
+# ==================== ПРОМОКОДЫ ====================
+def create_promo_code(code, reward_type, reward_value, max_uses):
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT INTO promo_codes (code, reward_type, reward_value, max_uses) VALUES (?,?,?,?)",
+            (code.upper(), reward_type, reward_value, max_uses)
+        )
+        conn.commit(); return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+def use_promo_code(uid, code):
+    conn = _db(); cur = conn.cursor()
+    code_upper = code.upper()
+    cur.execute("SELECT id, reward_type, reward_value, max_uses, uses, is_active FROM promo_codes WHERE code=?", (code_upper,))
+    row = cur.fetchone()
+    if not row:
+        conn.close(); return False, "❌ Промокод не найден"
+    pid, reward_type, reward_value, max_uses, uses, is_active = row
+    if not is_active:
+        conn.close(); return False, "❌ Промокод недействителен"
+    if max_uses > 0 and uses >= max_uses:
+        conn.close(); return False, "❌ Промокод исчерпан"
+    cur.execute("SELECT COUNT(*) FROM promo_uses WHERE user_id=? AND code=?", (uid, code_upper))
+    if cur.fetchone()[0] > 0:
+        conn.close(); return False, "❌ Вы уже использовали этот промокод"
+    if reward_type == "coins":
+        cur.execute("UPDATE players SET coins=coins+? WHERE user_id=?", (reward_value, uid))
+        msg = f"💰 Начислено <b>{reward_value} AC</b>!"
+    elif reward_type == "premium":
+        cur.execute("SELECT id FROM shop_items WHERE item_type='premium' LIMIT 1")
+        item = cur.fetchone()
+        if item:
+            cur.execute("INSERT INTO inventory (user_id, item_id, is_activated) VALUES (?,?,1)", (uid, item[0]))
+        msg = "👑 <b>Premium</b> активирован!"
+    elif reward_type == "quals":
+        cur.execute("UPDATE players SET quals_access=1 WHERE user_id=?", (uid,))
+        msg = "⭐ Доступ к <b>QUALS</b> открыт!"
+    else:
+        conn.close(); return False, "❌ Неизвестный тип награды"
+    cur.execute("INSERT INTO promo_uses (user_id, code) VALUES (?,?)", (uid, code_upper))
+    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE id=?", (pid,))
+    conn.commit(); conn.close()
+    return True, msg
+
+def get_all_promo_codes():
+    conn = _db(); cur = conn.cursor()
+    cur.execute("SELECT code, reward_type, reward_value, max_uses, uses, is_active FROM promo_codes ORDER BY id DESC")
+    rows = cur.fetchall(); conn.close(); return rows
+
+def deactivate_promo_code(code):
+    conn = _db()
+    conn.execute("UPDATE promo_codes SET is_active=0 WHERE code=?", (code.upper(),))
+    conn.commit(); conn.close()
+
 # ==================== МАГАЗИН ХЕЛПЕРЫ ====================
 def get_shop_item(item_id):
     conn = _db(); cur = conn.cursor()
@@ -424,9 +523,53 @@ def get_party_max_size(party):
         if has_active_premium(m): return 3
     return 2
 
+# ==================== КАПИТАН (premium +7%) ====================
+def pick_captain(team):
+    if not team: return None
+    weights = [1.07 if has_active_premium(u) else 1.0 for u in team]
+    return random.choices(team, weights=weights, k=1)[0]
+
+# ==================== ТЕХРАБОТЫ (MIDDLEWARE) ====================
+@bot.middleware_handler(update_types=["message", "callback_query"])
+def maintenance_middleware(bot_instance, update):
+    global maintenance_mode
+    if not maintenance_mode:
+        return
+    if hasattr(update, "from_user") and update.from_user:
+        uid = update.from_user.id
+    else:
+        return
+    # Администраторам проход разрешён всегда
+    if uid in ADMIN_IDS_LIST:
+        return
+    p = get_player(uid)
+    if p and p[11] == 1:
+        return
+    # Блокируем обычных пользователей
+    if hasattr(update, "message"):
+        # callback_query
+        try:
+            bot_instance.answer_callback_query(
+                update.id,
+                "🔧 Технические работы!\nБот временно недоступен. Попробуйте позже.",
+                show_alert=True
+            )
+        except Exception:
+            pass
+    else:
+        # message
+        try:
+            bot_instance.send_message(
+                update.chat.id,
+                "🔧 <b>Технические работы</b>\n\nБот временно недоступен для игроков. Попробуйте позже."
+            )
+        except Exception:
+            pass
+    return CancelUpdate()
+
+
 # ==================== ПРОВЕРКА БЛОКИРОВОК ====================
 def check_blocked(uid):
-    """Возвращает текст ошибки если пользователь заблокирован, иначе None."""
     if is_banned_check(uid):
         return "🚫 Вы заблокированы в боте."
     if is_on_check_db(uid):
@@ -443,13 +586,23 @@ def check_blocked(uid):
 # ==================== ГЛАВНОЕ МЕНЮ ====================
 def main_menu(uid):
     kb = types.InlineKeyboardMarkup(row_width=2)
+    # Если в лобби — кнопка "Вернуться в лобби", иначе "Найти матч"
+    if uid in user_lobby:
+        kb.add(
+            types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+            types.InlineKeyboardButton("🔄 Вернуться в лобби", callback_data="rejoin_lobby"),
+        )
+    else:
+        kb.add(
+            types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+            types.InlineKeyboardButton("🎮 Найти матч", callback_data="find"),
+        )
     kb.add(
-        types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
-        types.InlineKeyboardButton("🎮 Найти матч", callback_data="find"),
         types.InlineKeyboardButton("🏆 Топ", callback_data="top"),
         types.InlineKeyboardButton("🛒 Магазин", callback_data="shop"),
         types.InlineKeyboardButton("🎒 Инвентарь", callback_data="inv"),
         types.InlineKeyboardButton("💳 Купить монеты", callback_data="buy_coins"),
+        types.InlineKeyboardButton("🎁 Промокод", callback_data="promo"),
     )
     in_party = uid in user_party
     kb.add(types.InlineKeyboardButton(
@@ -468,7 +621,6 @@ def main_menu(uid):
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     uid = msg.from_user.id
-    # Сохраняем username
     if msg.from_user.username:
         update_tg_username(uid, msg.from_user.username)
     err = check_blocked(uid)
@@ -480,6 +632,63 @@ def cmd_start(msg):
     bot.send_message(uid, "👋 Добро пожаловать!\n\n<b>Шаг 1:</b> Введи свой никнейм (2-20 символов):")
 
 
+# Кнопка "Вернуться в лобби"
+@bot.callback_query_handler(func=lambda c: c.data == "rejoin_lobby")
+def cb_rejoin_lobby(c):
+    uid = c.from_user.id
+    lobby_id = user_lobby.get(uid)
+    if not lobby_id:
+        bot.answer_callback_query(c.id, "❌ Вы не в лобби")
+        bot.edit_message_text("⚡ ACTUAL FACEIT", c.message.chat.id, c.message.message_id, reply_markup=main_menu(uid))
+        return
+    lobby = active_lobbies.get(lobby_id)
+    if not lobby or lobby.get("status") != "waiting":
+        bot.answer_callback_query(c.id, "❌ Лобби недоступно")
+        bot.edit_message_text("⚡ ACTUAL FACEIT", c.message.chat.id, c.message.message_id, reply_markup=main_menu(uid))
+        return
+    text = build_lobby_text(lobby_id)
+    kb = build_lobby_kb(lobby_id, uid)
+    bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
+    if lobby_player_messages.get(lobby_id) is None:
+        lobby_player_messages[lobby_id] = {}
+    lobby_player_messages[lobby_id][uid] = (c.message.chat.id, c.message.message_id)
+    bot.answer_callback_query(c.id)
+
+
+# ==================== ПРОМОКОД (пользователь) ====================
+@bot.callback_query_handler(func=lambda c: c.data == "promo")
+def cb_promo(c):
+    uid = c.from_user.id
+    err = check_blocked(uid)
+    if err:
+        bot.answer_callback_query(c.id, "⚠️ Доступ ограничен", show_alert=True); return
+    if not is_registered(uid):
+        bot.answer_callback_query(c.id, "❌ Сначала зарегистрируйтесь /start"); return
+    promo_flow[uid] = True
+    bot.answer_callback_query(c.id)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="promo_cancel"))
+    bot.send_message(uid, "🎁 Введите промокод:", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data == "promo_cancel")
+def cb_promo_cancel(c):
+    uid = c.from_user.id
+    promo_flow.pop(uid, None)
+    bot.answer_callback_query(c.id)
+    try: bot.delete_message(c.message.chat.id, c.message.message_id)
+    except Exception: pass
+
+@bot.message_handler(func=lambda m: m.from_user.id in promo_flow and m.text is not None)
+def handle_promo_input(msg):
+    uid = msg.from_user.id
+    promo_flow.pop(uid, None)
+    code = msg.text.strip()
+    ok, result_msg = use_promo_code(uid, code)
+    p = get_player(uid)
+    balance = f"\n💰 Баланс: <b>{p[5]} AC</b>" if p and ok else ""
+    bot.send_message(uid, f"{result_msg}{balance}")
+
+
 # ==================== РЕГИСТРАЦИЯ ====================
 @bot.message_handler(func=lambda m: user_flow.get(m.from_user.id, {}).get("state") == "nick")
 def reg_nick(msg):
@@ -488,36 +697,23 @@ def reg_nick(msg):
     if not (2 <= len(nick) <= 20):
         bot.send_message(uid, "❌ Никнейм 2-20 символов"); return
     if nick_taken(nick):
-        bot.send_message(uid,
-            "❌ <b>Этот никнейм уже занят!</b>\n\n"
-            "Если это ваш никнейм — обратитесь к администратору для подтверждения.\n"
-            "Введите другой никнейм:"); return
+        bot.send_message(uid, "❌ <b>Этот никнейм уже занят!</b>\n\nЕсли это ваш никнейм — обратитесь к администратору.\nВведите другой никнейм:"); return
     user_flow[uid] = {"state": "id", "nick": nick}
-    bot.send_message(uid,
-        "<b>Шаг 2:</b> Введи игровой ID\n\n"
-        "Можно: русские и английские буквы, цифры, <code>_</code> и <code>-</code>\n"
-        "Пример: <code>мойid_123</code> или <code>myid_123</code>")
-
+    bot.send_message(uid, "<b>Шаг 2:</b> Введи игровой ID\n\nМожно: русские и английские буквы, цифры, <code>_</code> и <code>-</code>")
 
 @bot.message_handler(func=lambda m: user_flow.get(m.from_user.id, {}).get("state") == "id")
 def reg_id(msg):
     uid = msg.from_user.id
     game_id = msg.text.strip()
     if not re.match(r'^[a-zA-ZА-Яа-яёЁ0-9_-]+$', game_id):
-        bot.send_message(uid,
-            "❌ Недопустимые символы!\n\n"
-            "Можно: русские/английские буквы, цифры (0-9), <code>_</code>, <code>-</code>"); return
+        bot.send_message(uid, "❌ Недопустимые символы! Только буквы, цифры, <code>_</code>, <code>-</code>"); return
     if game_id_taken(game_id):
-        bot.send_message(uid,
-            "❌ <b>Этот Game ID уже занят!</b>\n\n"
-            "Если это ваш ID — обратитесь к администратору для подтверждения.\n"
-            "Введите другой Game ID:"); return
+        bot.send_message(uid, "❌ <b>Этот Game ID уже занят!</b>\n\nВведите другой Game ID:"); return
     user_flow[uid]["game_id"] = game_id
     user_flow[uid]["state"] = "device"
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     kb.row("MOBILE", "PC")
     bot.send_message(uid, "<b>Шаг 3:</b> Выбери устройство:", reply_markup=kb)
-
 
 @bot.message_handler(func=lambda m: user_flow.get(m.from_user.id, {}).get("state") == "device")
 def reg_device(msg):
@@ -528,14 +724,11 @@ def reg_device(msg):
     data = user_flow.pop(uid)
     tg_u = msg.from_user.username or ""
     register_user(uid, data["nick"], data["game_id"], device, tg_u)
-    bot.send_message(uid,
-        f"✅ Регистрация завершена!\n\nНик: <b>{data['nick']}</b>\n"
-        f"Game ID: <code>{data['game_id']}</code>\nDevice: {device}",
-        reply_markup=types.ReplyKeyboardRemove())
+    bot.send_message(uid, f"✅ Регистрация завершена!\n\nНик: <b>{data['nick']}</b>\nGame ID: <code>{data['game_id']}</code>\nDevice: {device}", reply_markup=types.ReplyKeyboardRemove())
     bot.send_message(uid, "⚡ ACTUAL FACEIT", reply_markup=main_menu(uid))
 
 
-# ==================== СМЕНА ДАННЫХ (ПРОФИЛЬ) ====================
+# ==================== СМЕНА ДАННЫХ ====================
 @bot.callback_query_handler(func=lambda c: c.data in ("change_nick", "change_game_id"))
 def cb_change_own(c):
     uid = c.from_user.id
@@ -543,15 +736,9 @@ def cb_change_own(c):
     change_flow[uid] = {"field": field}
     bot.answer_callback_query(c.id)
     if field == "nick":
-        bot.send_message(uid,
-            "✏️ Введите новый никнейм (2-20 символов):\n\n"
-            "<i>Если этот ник уже занят — вам откажут. Обратитесь к администратору.</i>")
+        bot.send_message(uid, "✏️ Введите новый никнейм (2-20 символов):")
     else:
-        bot.send_message(uid,
-            "🎮 Введите новый Game ID:\n\n"
-            "Только английские буквы, цифры, <code>_</code> и <code>-</code>\n"
-            "<i>Если этот ID уже занят — вам откажут. Обратитесь к администратору.</i>")
-
+        bot.send_message(uid, "🎮 Введите новый Game ID:\n\nТолько буквы, цифры, <code>_</code> и <code>-</code>")
 
 @bot.message_handler(func=lambda m: m.from_user.id in change_flow and "field" in change_flow.get(m.from_user.id, {}) and m.text is not None)
 def handle_change_flow(msg):
@@ -560,53 +747,38 @@ def handle_change_flow(msg):
     data = change_flow.pop(uid)
     field = data["field"]
     text = msg.text.strip()
-
-    # Смена своего ника
     if field == "nick":
         if not (2 <= len(text) <= 20):
             bot.send_message(uid, "❌ Никнейм 2-20 символов."); return
         if nick_taken(text, exclude_uid=uid):
-            bot.send_message(uid,
-                "❌ <b>Этот никнейм уже занят!</b>\n\n"
-                "Если он принадлежит вам — обратитесь к администратору."); return
+            bot.send_message(uid, "❌ <b>Этот никнейм уже занят!</b>"); return
         conn = _db(); conn.execute("UPDATE players SET username=? WHERE user_id=?", (text, uid)); conn.commit(); conn.close()
         bot.send_message(uid, f"✅ Никнейм изменён на <b>{text}</b>!")
-
-    # Смена своего game_id
     elif field == "game_id":
         if not re.match(r'^[a-zA-ZА-Яа-яёЁ0-9_-]+$', text):
-            bot.send_message(uid, "❌ Только русские/английские буквы, цифры, <code>_</code> и <code>-</code>"); return
+            bot.send_message(uid, "❌ Только буквы, цифры, <code>_</code> и <code>-</code>"); return
         if game_id_taken(text, exclude_uid=uid):
-            bot.send_message(uid,
-                "❌ <b>Этот Game ID уже занят!</b>\n\n"
-                "Если он принадлежит вам — обратитесь к администратору."); return
+            bot.send_message(uid, "❌ <b>Этот Game ID уже занят!</b>"); return
         conn = _db(); conn.execute("UPDATE players SET game_id=? WHERE user_id=?", (text, uid)); conn.commit(); conn.close()
         bot.send_message(uid, f"✅ Game ID изменён на <code>{text}</code>!")
-
-    # Админ: смена ника другому игроку
     elif field == "admin_nick":
         target_id = data.get("target_id")
-        if not target_id:
-            bot.send_message(uid, "❌ Ошибка: нет target_id"); return
+        if not target_id: return
         if not (2 <= len(text) <= 20):
             bot.send_message(uid, "❌ Никнейм 2-20 символов."); return
         if nick_taken(text, exclude_uid=target_id):
-            bot.send_message(uid, f"❌ Никнейм <b>{text}</b> уже занят другим игроком!", parse_mode="HTML"); return
+            bot.send_message(uid, f"❌ Никнейм <b>{text}</b> уже занят!"); return
         conn = _db(); conn.execute("UPDATE players SET username=? WHERE user_id=?", (text, target_id)); conn.commit(); conn.close()
-        p = get_player(target_id)
         bot.send_message(uid, f"✅ Никнейм игрока изменён на <b>{text}</b>!")
         try: bot.send_message(target_id, f"✏️ Администратор изменил ваш никнейм на <b>{text}</b>!")
         except Exception: pass
-
-    # Админ: смена game_id другому игроку
     elif field == "admin_id":
         target_id = data.get("target_id")
-        if not target_id:
-            bot.send_message(uid, "❌ Ошибка: нет target_id"); return
+        if not target_id: return
         if not re.match(r'^[a-zA-ZА-Яа-яёЁ0-9_-]+$', text):
-            bot.send_message(uid, "❌ Только русские/английские буквы, цифры, <code>_</code> и <code>-</code>"); return
+            bot.send_message(uid, "❌ Только буквы, цифры, <code>_</code> и <code>-</code>"); return
         if game_id_taken(text, exclude_uid=target_id):
-            bot.send_message(uid, f"❌ Game ID <code>{text}</code> уже занят другим игроком!", parse_mode="HTML"); return
+            bot.send_message(uid, f"❌ Game ID <code>{text}</code> уже занят!"); return
         conn = _db(); conn.execute("UPDATE players SET game_id=? WHERE user_id=?", (text, target_id)); conn.commit(); conn.close()
         bot.send_message(uid, f"✅ Game ID игрока изменён на <code>{text}</code>!")
         try: bot.send_message(target_id, f"🎮 Администратор изменил ваш Game ID на <code>{text}</code>!")
@@ -626,7 +798,7 @@ def cb_profile(c):
     warns = p[15] if len(p) > 15 else 0
     quals = "✅" if (len(p) > 16 and p[16] == 1) else "❌"
     premium = has_active_premium(uid)
-    crown = " 👑" if premium else ""
+    crown = " 👑 Premium" if premium else ""
     lvl = get_faceit_level(p[4])
     muted = is_muted_check(uid)
     mute_text = ""
@@ -635,7 +807,7 @@ def cb_profile(c):
         mute_text = f"\n🔇 Мут: {mins} мин."
     text = (
         f"👤 <b>{p[1]}</b>{crown}\n"
-        f"🆔 Telegram ID: {p[0]}\n"
+        f"🆔 Telegram ID: <code>{p[0]}</code>\n"
         f"🎮 Game ID: <code>{p[2]}</code>\n"
         f"📱 Device: {p[3]}\n"
         f"📊 ELO: {p[4]} | 🎯 Lvl {lvl}\n"
@@ -668,7 +840,8 @@ def cb_top(c):
         winrate = round(wins / games * 100, 1) if games > 0 else 0
         kd = round(kills / deaths, 2) if deaths > 0 else kills
         lvl = get_faceit_level(elo)
-        text += f"{medals.get(i, f'{i}.')} <b>{name}</b> [Lvl {lvl}]\n   ELO: {elo} | {wins}W/{losses}L ({winrate}%) | K/D: {kd}\n\n"
+        prem = " 👑" if has_active_premium(uid2) else ""
+        text += f"{medals.get(i, f'{i}.')} <b>{name}</b>{prem} [Lvl {lvl}]\n   ELO: {elo} | {wins}W/{losses}L ({winrate}%) | K/D: {kd}\n\n"
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back"))
     bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
@@ -695,7 +868,8 @@ def build_lobby_text(lobby_id):
         p = get_player(pid)
         if p:
             icon = "🤖" if p[13] else "👤"
-            text += f"{i}. {icon} {p[1]} [Lvl {get_faceit_level(p[4])} | {p[4]} ELO]\n"
+            prem = " 👑" if (not p[13] and has_active_premium(pid)) else ""
+            text += f"{i}. {icon} {p[1]}{prem} [Lvl {get_faceit_level(p[4])} | {p[4]} ELO]\n"
         else:
             text += f"{i}. {pid}\n"
     return text
@@ -766,8 +940,7 @@ def cb_join(c):
             bot.answer_callback_query(c.id, "❌ Ошибка формата"); return
         league, device, slot = parts[1], parts[2], int(parts[3])
         uid = c.from_user.id
-        if msg := c.from_user.username: update_tg_username(uid, msg)
-
+        if c.from_user.username: update_tg_username(uid, c.from_user.username)
         err = check_blocked(uid)
         if err:
             bot.answer_callback_query(c.id, "⚠️ Доступ ограничен", show_alert=True); return
@@ -778,21 +951,16 @@ def cb_join(c):
         if is_muted_check(uid):
             mins = get_mute_remaining(uid) // 60
             bot.answer_callback_query(c.id, f"🔇 Вы замучены! Осталось: {mins} мин.", show_alert=True); return
-
         lobby_id = f"{league}_{device}_{slot}"
-
-        # Выходим из старого лобби
         old = user_lobby.get(uid)
         if old and old in active_lobbies and uid in active_lobbies[old].get("players", []):
             active_lobbies[old]["players"].remove(uid)
             lobby_player_messages.get(old, {}).pop(uid, None)
             if not active_lobbies[old]["players"]:
-                del active_lobbies[old]
-                lobby_player_messages.pop(old, None)
+                del active_lobbies[old]; lobby_player_messages.pop(old, None)
             else:
                 broadcast_lobby_update(old)
             user_lobby.pop(uid, None)
-
         if lobby_id not in active_lobbies:
             active_lobbies[lobby_id] = {"players": [], "league": league, "device": device, "slot": slot, "status": "waiting"}
         lobby = active_lobbies[lobby_id]
@@ -802,7 +970,6 @@ def cb_join(c):
             bot.answer_callback_query(c.id, "❌ Лобби полное!", show_alert=True); return
         if uid in lobby["players"]:
             bot.answer_callback_query(c.id, "✅ Вы уже в этом лобби!"); return
-
         lobby["players"].append(uid)
         user_lobby[uid] = lobby_id
         text = build_lobby_text(lobby_id)
@@ -813,13 +980,10 @@ def cb_join(c):
                 lobby_player_messages[lobby_id] = {}
             lobby_player_messages[lobby_id][uid] = (c.message.chat.id, c.message.message_id)
         except Exception: pass
-
         bot.answer_callback_query(c.id, f"✅ Вы вошли в лобби #{slot}!")
         broadcast_lobby_update(lobby_id, exclude_uid=uid)
-
         if len(lobby["players"]) >= 10:
             start_accept_phase(lobby_id)
-
     except Exception as e:
         print(f"Join error: {e}")
         bot.answer_callback_query(c.id, "❌ Ошибка")
@@ -830,6 +994,9 @@ def cb_leave(c):
     uid = c.from_user.id
     lobby_id = c.data.split("leave_", 1)[1]
     lobby = active_lobbies.get(lobby_id)
+    # Нельзя выйти во время фазы принятия
+    if lobby and lobby.get("status") == "accepting":
+        bot.answer_callback_query(c.id, "❌ Нельзя выйти во время принятия матча!", show_alert=True); return
     if lobby and uid in lobby.get("players", []):
         lobby["players"].remove(uid)
         lobby_player_messages.get(lobby_id, {}).pop(uid, None)
@@ -845,24 +1012,78 @@ def cb_leave(c):
 
 
 # ==================== ФАЗА ПРИНЯТИЯ ====================
+def build_accept_text(lobby_id):
+    lobby = active_lobbies.get(lobby_id)
+    if not lobby: return ""
+    accepted = lobby.get("accepted", [])
+    real_players = [u for u in lobby["players"] if not is_bot_player(u)]
+    text = "🔔 <b>Матч найден! Статус принятия:</b>\n\n"
+    for u in real_players:
+        p = get_player(u)
+        name = p[1] if p else str(u)
+        prem = " 👑" if has_active_premium(u) else ""
+        icon = "✅" if u in accepted else "⏳"
+        text += f"{icon} {name}{prem}\n"
+    accepted_cnt = len([u for u in accepted if not is_bot_player(u)])
+    text += f"\n<b>{accepted_cnt}/{len(real_players)}</b> приняли"
+    return text
+
+def update_accept_status(lobby_id):
+    msgs = accept_status_messages.get(lobby_id, {})
+    if not msgs: return
+    text = build_accept_text(lobby_id)
+    for uid, (cid, mid) in list(msgs.items()):
+        try: bot.edit_message_text(text, cid, mid)
+        except Exception: pass
+
+def delete_accept_status(lobby_id):
+    msgs = accept_status_messages.pop(lobby_id, {})
+    for uid, (cid, mid) in msgs.items():
+        try: bot.delete_message(cid, mid)
+        except Exception: pass
+
+def delete_match_found(lobby_id):
+    msgs = match_found_messages.pop(lobby_id, {})
+    for uid, (cid, mid) in msgs.items():
+        try: bot.delete_message(cid, mid)
+        except Exception: pass
+
+def delete_ban_status(lobby_id):
+    msgs = ban_status_messages.pop(lobby_id, {})
+    for uid, (cid, mid) in msgs.items():
+        try: bot.delete_message(cid, mid)
+        except Exception: pass
+
 def start_accept_phase(lobby_id):
     lobby = active_lobbies.get(lobby_id)
     if not lobby: return
     lobby["status"] = "accepting"
     lobby["accepted"] = []
     lobby_player_messages.pop(lobby_id, None)
+    accept_status_messages[lobby_id] = {}
 
+    match_found_messages[lobby_id] = {}
     for uid in lobby["players"]:
         if is_bot_player(uid):
             lobby["accepted"].append(uid); continue
         try:
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("✅ Принять матч", callback_data=f"accept_{lobby_id}"))
-            bot.send_message(uid,
+            sent = bot.send_message(uid,
                 f"🔔 <b>Матч найден!</b>\n\n"
                 f"🏷 Лига: {lobby['league'].upper()}\n📱 Устройство: {lobby['device'].upper()}\n\n"
                 f"⏱ У вас <b>{ACCEPT_TIMEOUT} секунд</b> чтобы принять.\nПри непринятии — предупреждение ⚠️",
                 reply_markup=kb)
+            match_found_messages[lobby_id][uid] = (sent.chat.id, sent.message_id)
+        except Exception: pass
+
+    # Статусное сообщение со списком игроков
+    for uid in lobby["players"]:
+        if is_bot_player(uid): continue
+        try:
+            text = build_accept_text(lobby_id)
+            sent = bot.send_message(uid, text)
+            accept_status_messages[lobby_id][uid] = (sent.chat.id, sent.message_id)
         except Exception: pass
 
     def check_accept():
@@ -870,6 +1091,8 @@ def start_accept_phase(lobby_id):
         lobby2 = active_lobbies.get(lobby_id)
         if not lobby2 or lobby2["status"] != "accepting": return
         not_accepted = [u for u in lobby2["players"] if u not in lobby2.get("accepted", [])]
+        # Удаляем статусное сообщение
+        delete_accept_status(lobby_id)
         if not_accepted:
             for uid in not_accepted:
                 if is_bot_player(uid): continue
@@ -907,19 +1130,16 @@ def cb_accept(c):
     if uid not in lobby.get("accepted", []):
         lobby["accepted"].append(uid)
     bot.answer_callback_query(c.id, "✅ Принято!")
+    # Убираем кнопку принятия
     try: bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
     except Exception: pass
+    # Обновляем статусное сообщение для всех
+    update_accept_status(lobby_id)
 
-    accepted_real = len([u for u in lobby["accepted"] if not is_bot_player(u)])
-    total_real = len([u for u in lobby["players"] if not is_bot_player(u)])
-    for puid in lobby["players"]:
-        if is_bot_player(puid) or puid == uid: continue
-        try: bot.send_message(puid, f"✅ Игрок принял матч ({accepted_real}/{total_real})")
-        except Exception: pass
-
-    # Защита от двойного вызова: меняем статус ДО вызова start_map_ban_phase
     if len(lobby["accepted"]) >= len(lobby["players"]) and lobby["status"] == "accepting":
         lobby["status"] = "pre_mapban"
+        # Удаляем статусное сообщение — матч принят всеми
+        delete_accept_status(lobby_id)
         threading.Thread(target=start_map_ban_phase, args=(lobby_id,), daemon=True).start()
 
 
@@ -978,8 +1198,11 @@ def start_map_ban_phase(lobby_id):
     lobby["ban_turn"] = "ct"
     lobby["ban_count"] = 0
     players = lobby["players"]
-    lobby["ct_captain"] = players[0]
-    lobby["t_captain"]  = players[5] if len(players) > 5 else players[-1]
+    # Удаляем сообщения "Матч найден!" перед началом бана карт
+    delete_match_found(lobby_id)
+    # Premium +7% шанс стать капитаном
+    lobby["ct_captain"] = pick_captain(players[:5] if len(players) >= 5 else players)
+    lobby["t_captain"]  = pick_captain(players[5:] if len(players) > 5 else players[-1:])
     send_ban_status_to_all(lobby_id)
     _do_ban_turn(lobby_id)
 
@@ -1006,9 +1229,11 @@ def _send_ban_keyboard(lobby_id, captain_uid):
     for m in lobby["maps_remaining"]:
         kb.add(types.InlineKeyboardButton(f"❌ {m}", callback_data=f"banmap_{lobby_id}_{m}"))
     try:
-        bot.send_message(captain_uid,
+        sent = bot.send_message(captain_uid,
             f"{'💙' if turn=='ct' else '🧡'} <b>Твой ход — забань карту:</b>",
             reply_markup=kb)
+        # Сохраняем сообщение хода для последующего удаления
+        ban_turn_messages[lobby_id] = (sent.chat.id, sent.message_id)
     except Exception as e:
         print(f"Ban keyboard error: {e}")
 
@@ -1047,8 +1272,10 @@ def cb_ban_map(c):
     if map_name not in lobby["maps_remaining"]:
         bot.answer_callback_query(c.id, "❌ Карта уже забанена"); return
     bot.answer_callback_query(c.id, f"✅ {map_name} забанена!")
-    try: bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
+    # Удаляем сообщение "твой ход" — не спамим
+    try: bot.delete_message(c.message.chat.id, c.message.message_id)
     except Exception: pass
+    ban_turn_messages.pop(lobby_id, None)
     _apply_ban(lobby_id, uid, map_name)
 
 
@@ -1057,7 +1284,8 @@ def pline(uid):
     p = get_player(uid)
     if p:
         icon = "🤖" if p[13] else "👤"
-        return f"{icon} {p[1]} [Lvl {get_faceit_level(p[4])} | {p[4]} ELO]"
+        prem = " 👑" if (not p[13] and has_active_premium(uid)) else ""
+        return f"{icon} {p[1]}{prem} [Lvl {get_faceit_level(p[4])} | {p[4]} ELO]"
     return str(uid)
 
 def launch_match(lobby_id):
@@ -1148,20 +1376,16 @@ def launch_match(lobby_id):
         try: bot.send_message(uid, player_text, reply_markup=kb_player)
         except Exception: pass
 
-    # Перемещаем матч в running_matches и освобождаем лобби-слот
     running_matches[lobby_id] = lobby
     parts = lobby_id.split("_")
     if len(parts) >= 3:
         league_r, device_r, slot_r = parts[0], parts[1], parts[2]
-        active_lobbies[lobby_id] = {
-            "players": [], "league": league_r, "device": device_r,
-            "slot": slot_r, "status": "waiting",
-        }
+        active_lobbies[lobby_id] = {"players": [], "league": league_r, "device": device_r, "slot": slot_r, "status": "waiting"}
     else:
         active_lobbies.pop(lobby_id, None)
 
     lobby_player_messages.pop(lobby_id, None)
-    ban_status_messages.pop(lobby_id, None)
+    delete_ban_status(lobby_id)
     for uid in players:
         user_lobby.pop(uid, None)
 
@@ -1259,10 +1483,8 @@ def cb_reg_match(c):
     if taken and taken != uid:
         p = get_player(taken)
         bot.answer_callback_query(c.id, f"❌ Регистрацию взял {p[1] if p else taken}", show_alert=True); return
-
     lobby["reg_taken_by"] = uid
-    match_id = lobby.get("match_id", "?")
-    sc = lobby.get("screenshots_count", 0)
+    match_id = lobby.get("match_id", "?"); sc = lobby.get("screenshots_count", 0)
     try:
         new_kb = _build_admin_match_kb(lobby_id, match_id, sc, taken_by=uid)
         thread_id = lobby.get("admin_thread_id")
@@ -1271,12 +1493,10 @@ def cb_reg_match(c):
         bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, **edit_kw)
     except Exception: pass
     bot.answer_callback_query(c.id, "✅ Регистрация захвачена!")
-
     def pln(uid2):
         p = get_player(uid2); return f"{p[1]} — <code>{uid2}</code>" if p else str(uid2)
     ct_list = "\n".join([pln(u) for u in lobby.get("team_ct", [])])
     t_list  = "\n".join([pln(u) for u in lobby.get("team_t",  [])])
-
     reply_chat_id   = c.message.chat.id
     reply_thread_id = getattr(c.message, "message_thread_id", None)
     instructions = (
@@ -1324,8 +1544,7 @@ def cb_cancel_match(c):
             if is_bot_player(puid): continue
             try: bot.send_message(puid, "❌ Матч отменён администрацией.")
             except Exception: pass
-        lobby["status"] = "cancelled"
-        lobby["reg_taken_by"] = None
+        lobby["status"] = "cancelled"; lobby["reg_taken_by"] = None
     try:
         bot.edit_message_text(
             (c.message.text or "") + "\n\n<b>❌ МАТЧ ОТМЕНЁН</b>",
@@ -1343,26 +1562,21 @@ def cb_reregister_match(c):
     lobby = running_matches.get(lobby_id)
     if not lobby:
         bot.answer_callback_query(c.id, "❌ Матч не найден"); return
-
     was_finished = lobby.get("status") == "finished"
     if was_finished:
-        # Откат статистики перед перерегистрацией
         revert_match_stats(lobby)
         match_id = lobby.get("match_id", "?")
         for puid in lobby.get("players", []):
             if is_bot_player(puid): continue
-            try: bot.send_message(puid,
-                f"🔄 <b>Матч #{match_id} открыт на перерегистрацию.</b>\n"
-                "Ваша статистика и ELO откатаны. Ждите новых результатов.")
+            try: bot.send_message(puid, f"🔄 <b>Матч #{match_id} открыт на перерегистрацию.</b>\nВаша статистика и ELO откатаны.")
             except Exception: pass
-
     lobby["status"] = "active"; lobby["reg_taken_by"] = None
     match_id = lobby.get("match_id", "?"); sc = lobby.get("screenshots_count", 0)
     try:
         new_kb = _build_admin_match_kb(lobby_id, match_id, sc)
         bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=new_kb)
     except Exception: pass
-    bot.answer_callback_query(c.id, "✅ Стата откатана, матч открыт для перерегистрации" if was_finished else "✅ Открыто для перерегистрации", show_alert=was_finished)
+    bot.answer_callback_query(c.id, "✅ Стата откатана, матч открыт" if was_finished else "✅ Открыто для перерегистрации", show_alert=was_finished)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("annul_match|"))
@@ -1374,29 +1588,19 @@ def cb_annul_match(c):
     lobby = running_matches.get(lobby_id)
     if not lobby:
         bot.answer_callback_query(c.id, "❌ Матч не найден"); return
-
-    match_id = lobby.get("match_id", "?")
-    was_finished = lobby.get("status") == "finished"
-
-    # Откат статистики
+    match_id = lobby.get("match_id", "?"); was_finished = lobby.get("status") == "finished"
     revert_match_stats(lobby)
     lobby["status"] = "cancelled"; lobby["reg_taken_by"] = None
-
-    # Уведомляем игроков
     for puid in lobby.get("players", []):
         if is_bot_player(puid): continue
         try:
             if was_finished:
-                bot.send_message(puid,
-                    f"⚠️ <b>Матч #{match_id} аннулирован администрацией.</b>\n"
-                    "Ваша статистика и ELO откатаны к значениям до матча.")
+                bot.send_message(puid, f"⚠️ <b>Матч #{match_id} аннулирован.</b>\nВаша статистика и ELO откатаны.")
             else:
                 bot.send_message(puid, f"❌ Матч #{match_id} аннулирован администрацией.")
         except Exception: pass
-
     try:
-        annul_text = (c.message.text or "") + "\n\n⚠️ <b>МАТЧ АННУЛИРОВАН (стата откатана)</b>"
-        bot.edit_message_text(annul_text, c.message.chat.id, c.message.message_id, reply_markup=None)
+        bot.edit_message_text((c.message.text or "") + "\n\n⚠️ <b>МАТЧ АННУЛИРОВАН</b>", c.message.chat.id, c.message.message_id, reply_markup=None)
     except Exception: pass
     bot.answer_callback_query(c.id, "✅ Матч аннулирован, стата откатана", show_alert=True)
 
@@ -1417,7 +1621,6 @@ def handle_match_reg(msg):
     lobby = running_matches.get(data["lobby_id"])
     if not lobby:
         del match_registration[uid]; reg_send(uid, "❌ Матч не найден", parse_mode="HTML"); return
-
     if step == "score":
         m = re.match(r"^(\d+):(\d+)$", text)
         if not m:
@@ -1432,7 +1635,6 @@ def handle_match_reg(msg):
         kw = {"reply_markup": kb, "parse_mode": "HTML"}
         if data.get("reply_thread_id"): kw["message_thread_id"] = data["reply_thread_id"]
         bot.send_message(data["reply_chat_id"], f"<b>Шаг 2/3</b> — Кто победил?\nСчёт: {w}:{l}", **kw)
-
     elif step == "stats_ct":
         stats = _parse_stats_block(text, lobby.get("team_ct", []))
         if stats is None:
@@ -1440,7 +1642,6 @@ def handle_match_reg(msg):
         data["stats_ct_raw"] = stats; data["step"] = "stats_t"
         t_names = ", ".join([get_player(u)[1] if get_player(u) else str(u) for u in lobby.get("team_t", [])])
         reg_send(uid, f"<b>Шаг 3/3</b> — Статистика T:\n<i>{t_names}</i>\n\nФормат (5 строк): <code>K D A</code>", parse_mode="HTML")
-
     elif step == "stats_t":
         stats = _parse_stats_block(text, lobby.get("team_t", []))
         if stats is None:
@@ -1459,8 +1660,7 @@ def cb_reg_winner(c):
         bot.answer_callback_query(c.id, "❌ Нет доступа"); return
     if uid not in match_registration:
         bot.answer_callback_query(c.id, "❌ Сессия не найдена"); return
-    parts = c.data.split("_")
-    winner = parts[-1]
+    parts = c.data.split("_"); winner = parts[-1]
     lobby_id = "_".join(parts[1:-1])
     lobby = running_matches.get(lobby_id)
     if not lobby:
@@ -1492,13 +1692,10 @@ def _parse_stats_block(text, team_uids):
 
 
 def revert_match_stats(lobby):
-    """Откатывает изменения ELO/статы/монет для всех игроков матча."""
     changes = lobby.get("applied_changes", {})
-    if not changes:
-        return
+    if not changes: return
     for uid, c in changes.items():
-        if is_bot_player(uid):
-            continue
+        if is_bot_player(uid): continue
         try:
             conn = _db(); cur = conn.cursor()
             cur.execute("SELECT elo, wins, losses, coins FROM players WHERE user_id=?", (uid,))
@@ -1512,9 +1709,7 @@ def revert_match_stats(lobby):
                     "UPDATE players SET elo=?, wins=?, losses=?, "
                     "kills=MAX(0,kills-?), deaths=MAX(0,deaths-?), assists=MAX(0,assists-?), "
                     "coins=? WHERE user_id=?",
-                    (new_elo, new_wins, new_losses,
-                     c["kills"], c["deaths"], c["assists"],
-                     new_coins, uid))
+                    (new_elo, new_wins, new_losses, c["kills"], c["deaths"], c["assists"], new_coins, uid))
             conn.commit(); conn.close()
         except Exception as e:
             print(f"Revert error uid={uid}: {e}")
@@ -1537,7 +1732,6 @@ def process_match_result(admin_uid, data, lobby):
         all_stats[s["user_id"]] = {**s, "won": winner == "ct"}
     for s in data.get("stats_t", []):
         all_stats[s["user_id"]] = {**s, "won": winner == "t"}
-
     match_id = lobby.get("match_id", "?")
     results = (
         f"📊 <b>РЕЗУЛЬТАТЫ МАТЧА #{match_id}</b>\n\n"
@@ -1545,8 +1739,6 @@ def process_match_result(admin_uid, data, lobby):
         f"🏆 Победитель: {'💙 CT' if winner=='ct' else '🧡 T'}\n"
         f"📋 Счёт: {data['score_w']}:{data['score_l']}\n\n"
     )
-
-    # Применяем изменения и сохраняем их для возможного отката
     applied_changes = {}
     for uid, s in all_stats.items():
         p = get_player(uid); name = p[1] if p else str(uid)
@@ -1555,16 +1747,8 @@ def process_match_result(admin_uid, data, lobby):
             elo_change = 25 if kills >= 12 else 17; coins = random.randint(10, 20); icon = "🏆"
         else:
             elo_change = -15 if kills >= 11 else -25; coins = random.randint(5, 6); icon = "💀"
-
-        applied_changes[uid] = {
-            "elo_change": elo_change,
-            "coins":      coins,
-            "kills":      kills,
-            "deaths":     s["deaths"],
-            "assists":    s["assists"],
-            "won":        s["won"],
-        }
-
+        applied_changes[uid] = {"elo_change": elo_change, "coins": coins,
+                                 "kills": kills, "deaths": s["deaths"], "assists": s["assists"], "won": s["won"]}
         conn = _db(); cur = conn.cursor()
         cur.execute("SELECT elo, wins, losses, coins FROM players WHERE user_id=?", (uid,))
         old = cur.fetchone()
@@ -1572,26 +1756,18 @@ def process_match_result(admin_uid, data, lobby):
             cur.execute(
                 "UPDATE players SET elo=?, wins=?, losses=?, kills=kills+?, deaths=deaths+?, assists=assists+?, coins=? WHERE user_id=?",
                 (max(100, old[0]+elo_change), old[1]+(1 if s["won"] else 0),
-                 old[2]+(0 if s["won"] else 1), kills, s["deaths"], s["assists"],
-                 old[3]+coins, uid))
+                 old[2]+(0 if s["won"] else 1), kills, s["deaths"], s["assists"], old[3]+coins, uid))
         conn.commit(); conn.close()
         results += f"{icon} <b>{name}</b> | {elo_change:+d} ELO | {kills}/{s['deaths']}/{s['assists']} K/D/A | +{coins} AC\n"
-
-    # Сохраняем изменения в лобби для возможного отката
     lobby["applied_changes"] = applied_changes
     lobby["last_result_text"] = results
-
     for uid in lobby.get("players", []):
         if is_bot_player(uid): continue
         try: bot.send_message(uid, results)
         except Exception: pass
-
     lobby["status"] = "finished"; lobby["reg_taken_by"] = None
     save_match_to_history(lobby, data, all_stats)
-
-    # Кнопки для управления уже зарегистрированным матчем
     finished_kb = _build_finished_match_kb(_lobby_id_from(lobby))
-
     if ADMIN_CHAT_ID:
         lobby_id = _lobby_id_from(lobby)
         thread_id = lobby.get("admin_thread_id")
@@ -1605,16 +1781,13 @@ def process_match_result(admin_uid, data, lobby):
             lobby["result_msg_id"] = sent.message_id
         except Exception as e:
             print(f"Result send error: {e}")
-
-    try: bot.send_message(admin_uid, f"✅ Матч #{match_id} зарегистрирован!\n\nВ чате администраторов доступны кнопки для перерегистрации или аннулирования.")
+    try: bot.send_message(admin_uid, f"✅ Матч #{match_id} зарегистрирован!")
     except Exception: pass
 
 
 def _lobby_id_from(lobby):
-    """Возвращает lobby_id из объекта лобби (поиск по running_matches)."""
     for lid, l in running_matches.items():
-        if l is lobby:
-            return lid
+        if l is lobby: return lid
     return str(lobby.get("match_id", "unknown"))
 
 
@@ -1670,8 +1843,7 @@ def cb_shop(c):
         types.InlineKeyboardButton("💳 Купить ActualCoin", callback_data="buy_coins"),
         types.InlineKeyboardButton("🔙 Назад", callback_data="back"),
     )
-    bot.edit_message_text(f"🛒 <b>МАГАЗИН</b>\n💰 Баланс: <b>{coins} AC</b>\n\nВыберите категорию:",
-                          c.message.chat.id, c.message.message_id, reply_markup=kb)
+    bot.edit_message_text(f"🛒 <b>МАГАЗИН</b>\n💰 Баланс: <b>{coins} AC</b>\n\nВыберите категорию:", c.message.chat.id, c.message.message_id, reply_markup=kb)
     bot.answer_callback_query(c.id)
 
 
@@ -1695,8 +1867,7 @@ def cb_shop_category(c):
         label = (f"✅ {name} — {price} AC" if (owned and not stackable) else f"🛍 {name} — {price} AC")
         kb.add(types.InlineKeyboardButton(label, callback_data=f"shop_item_{item_id}"))
     kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="shop"))
-    bot.edit_message_text(f"🛒 <b>{CATEGORY_NAMES.get(category, category)}</b>\n💰 {coins} AC\n\nНажми для покупки:",
-                          c.message.chat.id, c.message.message_id, reply_markup=kb)
+    bot.edit_message_text(f"🛒 <b>{CATEGORY_NAMES.get(category, category)}</b>\n💰 {coins} AC\n\nНажми для покупки:", c.message.chat.id, c.message.message_id, reply_markup=kb)
     bot.answer_callback_query(c.id)
 
 
@@ -1736,8 +1907,7 @@ def cb_shop_buy(c):
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(types.InlineKeyboardButton("🎒 Инвентарь", callback_data="inv"),
                types.InlineKeyboardButton("🔙 К категории", callback_data=f"shop_cat_{category}"))
-        bot.edit_message_text(f"{message}\n\n💰 Остаток: <b>{new_coins} AC</b>",
-                              c.message.chat.id, c.message.message_id, reply_markup=kb)
+        bot.edit_message_text(f"{message}\n\n💰 Остаток: <b>{new_coins} AC</b>", c.message.chat.id, c.message.message_id, reply_markup=kb)
         bot.answer_callback_query(c.id, "✅ Куплено!")
     else:
         bot.answer_callback_query(c.id, message, show_alert=True)
@@ -1812,7 +1982,7 @@ def handle_rename_flow(msg):
     if not (2 <= len(new_nick) <= 20):
         bot.send_message(uid, "❌ Никнейм 2-20 символов."); return
     if nick_taken(new_nick, exclude_uid=uid):
-        bot.send_message(uid, "❌ <b>Этот никнейм уже занят!</b>\nОбратитесь к администратору."); return
+        bot.send_message(uid, "❌ <b>Этот никнейм уже занят!</b>"); return
     inv_id = rename_flow.pop(uid)["inv_id"]
     conn = _db()
     conn.execute("UPDATE players SET username=? WHERE user_id=?", (new_nick, uid))
@@ -1830,8 +2000,7 @@ def cb_buy_coins(c):
     for i, (name, coins_amount, stars, price_label) in enumerate(COIN_PACKAGES):
         kb.add(types.InlineKeyboardButton(f"⭐ {name}: {coins_amount} AC — {stars} Stars ({price_label})", callback_data=f"buy_pkg_{i}"))
     kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back"))
-    bot.edit_message_text(f"💳 <b>КУПИТЬ ActualCoin</b>\n💰 Баланс: <b>{coins} AC</b>\n\n⭐ Telegram Stars\nВыберите пакет:",
-                          c.message.chat.id, c.message.message_id, reply_markup=kb)
+    bot.edit_message_text(f"💳 <b>КУПИТЬ ActualCoin</b>\n💰 Баланс: <b>{coins} AC</b>\n\n⭐ Telegram Stars\nВыберите пакет:", c.message.chat.id, c.message.message_id, reply_markup=kb)
     bot.answer_callback_query(c.id)
 
 
@@ -1874,6 +2043,57 @@ def successful_payment(msg):
         bot.send_message(uid, f"✅ Оплата получена, монеты будут начислены вручную. Ошибка: {e}")
 
 
+# ==================== РЕДАКТИРОВАНИЕ СТАТЫ ====================
+STAT_FIELDS = {
+    "kills":   ("kills",   "🔫 Убийства"),
+    "deaths":  ("deaths",  "💀 Смерти"),
+    "assists": ("assists", "🤝 Ассисты"),
+    "wins":    ("wins",    "🏆 Победы"),
+    "losses":  ("losses",  "❌ Поражения"),
+    "coins":   ("coins",   "💰 Монеты"),
+    "elo":     ("elo",     "📊 ELO"),
+}
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("editstat_"))
+def cb_editstat_pick(c):
+    uid = c.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(c.id, "❌ Нет доступа"); return
+    parts = c.data.split("_")
+    field = parts[1]
+    target_id = int(parts[2])
+    p = get_player(target_id)
+    if not p:
+        bot.answer_callback_query(c.id, "❌ Игрок не найден"); return
+    editstat_flow[uid] = {"field": field, "target_id": target_id}
+    bot.answer_callback_query(c.id)
+    _, label = STAT_FIELDS.get(field, (field, field))
+    bot.send_message(uid, f"✏️ Введите новое значение для <b>{label}</b> игрока <b>{p[1]}</b>:", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.from_user.id in editstat_flow and m.text is not None)
+def handle_editstat_flow(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid): return
+    data = editstat_flow.pop(uid)
+    field = data["field"]
+    target_id = data["target_id"]
+    p = get_player(target_id)
+    if not p:
+        bot.send_message(uid, "❌ Игрок не найден"); return
+    try:
+        value = int(msg.text.strip())
+        if value < 0: raise ValueError
+    except ValueError:
+        bot.send_message(uid, "❌ Введите целое неотрицательное число"); return
+    db_field, label = STAT_FIELDS.get(field, (field, field))
+    conn = _db()
+    conn.execute(f"UPDATE players SET {db_field}=? WHERE user_id=?", (value, target_id))
+    conn.commit(); conn.close()
+    bot.send_message(uid, f"✅ <b>{label}</b> игрока <b>{p[1]}</b> изменено на <b>{value}</b>!", parse_mode="HTML")
+    try: bot.send_message(target_id, f"✏️ Администратор изменил вашу статистику (<b>{label}</b>: {value}).", parse_mode="HTML")
+    except Exception: pass
+
+
 # ==================== АДМИН ПАНЕЛЬ ====================
 @bot.callback_query_handler(func=lambda c: c.data == "admin_panel")
 def cb_admin_panel(c):
@@ -1885,33 +2105,216 @@ def cb_admin_panel(c):
     text = (f"⚙️ <b>АДМИН ПАНЕЛЬ</b>\n\n"
             f"👥 Игроков: <b>{len(players)}</b>\n🎮 Лобби: <b>{len(active_lobbies)}</b>\n"
             f"🔴 Матчей: <b>{active_count}</b>\n\nВыберите действие:")
+    maint_btn = ("🟢 Вкл. тех. работы" if not maintenance_mode else "🔴 Выкл. тех. работы")
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("👥 Список игроков",     callback_data="admin_players"),
-        types.InlineKeyboardButton("🔍 Поиск по нику/ID",  callback_data="admin_search"),
-        types.InlineKeyboardButton("🔍 Поиск по Game ID",  callback_data="admin_search_gameid"),
-        types.InlineKeyboardButton("💰 Выдать монеты",      callback_data="admin_give_coins"),
-        types.InlineKeyboardButton("📊 Изменить ELO",       callback_data="admin_set_elo"),
-        types.InlineKeyboardButton("✏️ Изм. ник игрока",   callback_data="admin_change_nick"),
-        types.InlineKeyboardButton("🎮 Изм. Game ID игрока",callback_data="admin_change_gid"),
-        types.InlineKeyboardButton("⚠️ Выдать варн",        callback_data="admin_warn"),
-        types.InlineKeyboardButton("🔇 Мут",                callback_data="admin_mute"),
-        types.InlineKeyboardButton("🔊 Размутить",          callback_data="admin_unmute"),
-        types.InlineKeyboardButton("🔎 Вызвать на проверку",callback_data="admin_check"),
-        types.InlineKeyboardButton("✅ Снять проверку",     callback_data="admin_uncheck"),
-        types.InlineKeyboardButton("🚫 Бан / Разбан",       callback_data="admin_ban"),
-        types.InlineKeyboardButton("👑 Выдать/Снять админку",callback_data="admin_give_admin"),
-        types.InlineKeyboardButton("🎮 Роль Гейм Рег",     callback_data="admin_give_game_reg"),
-        types.InlineKeyboardButton("⭐ Quals доступ",       callback_data="admin_quals_access"),
-        types.InlineKeyboardButton("🎮 Управление матчами", callback_data="admin_matches"),
-        types.InlineKeyboardButton("📋 История матчей",     callback_data="admin_match_history"),
-        types.InlineKeyboardButton("📢 Рассылка",           callback_data="admin_broadcast"),
-        types.InlineKeyboardButton("🔙 Назад",              callback_data="back"),
+        types.InlineKeyboardButton(maint_btn,                 callback_data="admin_toggle_maintenance"),
+        types.InlineKeyboardButton("👥 Список игроков",       callback_data="admin_players"),
+        types.InlineKeyboardButton("🔍 Поиск по нику/ID",    callback_data="admin_search"),
+        types.InlineKeyboardButton("🔍 Поиск по Game ID",    callback_data="admin_search_gameid"),
+        types.InlineKeyboardButton("💰 Выдать монеты",        callback_data="admin_give_coins"),
+        types.InlineKeyboardButton("📊 Изменить ELO",         callback_data="admin_set_elo"),
+        types.InlineKeyboardButton("✏️ Изм. ник игрока",     callback_data="admin_change_nick"),
+        types.InlineKeyboardButton("🎮 Изм. Game ID игрока", callback_data="admin_change_gid"),
+        types.InlineKeyboardButton("📈 Редактировать стату",  callback_data="admin_edit_stats"),
+        types.InlineKeyboardButton("⚠️ Выдать варн",          callback_data="admin_warn"),
+        types.InlineKeyboardButton("🔇 Мут",                  callback_data="admin_mute"),
+        types.InlineKeyboardButton("🔊 Размутить",            callback_data="admin_unmute"),
+        types.InlineKeyboardButton("🔎 Вызвать на проверку",  callback_data="admin_check"),
+        types.InlineKeyboardButton("✅ Снять проверку",       callback_data="admin_uncheck"),
+        types.InlineKeyboardButton("🚫 Бан / Разбан",         callback_data="admin_ban"),
+        types.InlineKeyboardButton("👑 Выдать/Снять админку", callback_data="admin_give_admin"),
+        types.InlineKeyboardButton("🎮 Роль Гейм Рег",       callback_data="admin_give_game_reg"),
+        types.InlineKeyboardButton("⭐ Quals доступ",         callback_data="admin_quals_access"),
+        types.InlineKeyboardButton("🎁 Промокоды",            callback_data="admin_promos"),
+        types.InlineKeyboardButton("🎮 Управление матчами",   callback_data="admin_matches"),
+        types.InlineKeyboardButton("📋 История матчей",       callback_data="admin_match_history"),
+        types.InlineKeyboardButton("📢 Рассылка",             callback_data="admin_broadcast"),
+        types.InlineKeyboardButton("🔙 Назад",                callback_data="back"),
     )
     bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
     bot.answer_callback_query(c.id)
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "admin_toggle_maintenance")
+def cb_toggle_maintenance(c):
+    global maintenance_mode
+    uid = c.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(c.id, "❌ Нет доступа"); return
+    maintenance_mode = not maintenance_mode
+    status = "🔴 ВКЛЮЧЕНЫ" if maintenance_mode else "🟢 ВЫКЛЮЧЕНЫ"
+    bot.answer_callback_query(c.id, f"Технические работы: {status}", show_alert=True)
+    # Обновляем панель чтобы кнопка поменяла цвет
+    players = get_all_players()
+    active_count = sum(1 for l in running_matches.values() if l.get("status") == "active")
+    maint_status = "🔴 Тех. работы АКТИВНЫ" if maintenance_mode else "🟢 Бот работает в штатном режиме"
+    text = (f"⚙️ <b>АДМИН ПАНЕЛЬ</b>\n\n"
+            f"👥 Игроков: <b>{len(players)}</b>\n🎮 Лобби: <b>{len(active_lobbies)}</b>\n"
+            f"🔴 Матчей: <b>{active_count}</b>\n\n{maint_status}\n\nВыберите действие:")
+    maint_btn = ("🟢 Вкл. тех. работы" if not maintenance_mode else "🔴 Выкл. тех. работы")
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(maint_btn,                 callback_data="admin_toggle_maintenance"),
+        types.InlineKeyboardButton("👥 Список игроков",       callback_data="admin_players"),
+        types.InlineKeyboardButton("🔍 Поиск по нику/ID",    callback_data="admin_search"),
+        types.InlineKeyboardButton("🔍 Поиск по Game ID",    callback_data="admin_search_gameid"),
+        types.InlineKeyboardButton("💰 Выдать монеты",        callback_data="admin_give_coins"),
+        types.InlineKeyboardButton("📊 Изменить ELO",         callback_data="admin_set_elo"),
+        types.InlineKeyboardButton("✏️ Изм. ник игрока",     callback_data="admin_change_nick"),
+        types.InlineKeyboardButton("🎮 Изм. Game ID игрока", callback_data="admin_change_gid"),
+        types.InlineKeyboardButton("📈 Редактировать стату",  callback_data="admin_edit_stats"),
+        types.InlineKeyboardButton("⚠️ Выдать варн",          callback_data="admin_warn"),
+        types.InlineKeyboardButton("🔇 Мут",                  callback_data="admin_mute"),
+        types.InlineKeyboardButton("🔊 Размутить",            callback_data="admin_unmute"),
+        types.InlineKeyboardButton("🔎 Вызвать на проверку",  callback_data="admin_check"),
+        types.InlineKeyboardButton("✅ Снять проверку",       callback_data="admin_uncheck"),
+        types.InlineKeyboardButton("🚫 Бан / Разбан",         callback_data="admin_ban"),
+        types.InlineKeyboardButton("👑 Выдать/Снять админку", callback_data="admin_give_admin"),
+        types.InlineKeyboardButton("🎮 Роль Гейм Рег",       callback_data="admin_give_game_reg"),
+        types.InlineKeyboardButton("⭐ Quals доступ",         callback_data="admin_quals_access"),
+        types.InlineKeyboardButton("🎁 Промокоды",            callback_data="admin_promos"),
+        types.InlineKeyboardButton("🎮 Управление матчами",   callback_data="admin_matches"),
+        types.InlineKeyboardButton("📋 История матчей",       callback_data="admin_match_history"),
+        types.InlineKeyboardButton("📢 Рассылка",             callback_data="admin_broadcast"),
+        types.InlineKeyboardButton("🔙 Назад",                callback_data="back"),
+    )
+    try:
+        bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
+    except Exception:
+        pass
+
+
+# ==================== ПРОМОКОДЫ (АДМИН) ====================
+@bot.callback_query_handler(func=lambda c: c.data == "admin_promos")
+def cb_admin_promos(c):
+    uid = c.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(c.id, "❌ Нет доступа"); return
+    codes = get_all_promo_codes()
+    text = "🎁 <b>ПРОМОКОДЫ</b>\n\n"
+    if codes:
+        for code, rtype, rval, max_uses, uses, is_active in codes:
+            status = "✅" if is_active else "❌"
+            max_str = f"/{max_uses}" if max_uses > 0 else "/∞"
+            rtype_names = {"coins": f"💰 {rval} AC", "premium": "👑 Premium", "quals": "⭐ Quals"}
+            text += f"{status} <code>{code}</code> — {rtype_names.get(rtype, rtype)} | {uses}{max_str} исп.\n"
+    else:
+        text += "Промокодов нет."
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("➕ Создать промокод", callback_data="admin_promo_create"),
+        types.InlineKeyboardButton("❌ Деактивировать промокод", callback_data="admin_promo_deactivate"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_panel"),
+    )
+    bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
+    bot.answer_callback_query(c.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_promo_create")
+def cb_admin_promo_create(c):
+    uid = c.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(c.id, "❌ Нет доступа"); return
+    promo_admin_flow[uid] = {"step": "code"}
+    bot.answer_callback_query(c.id)
+    bot.send_message(uid,
+        "🎁 <b>Создание промокода</b>\n\n"
+        "<b>Шаг 1/4</b> — Введите код промокода (только буквы и цифры):\n"
+        "Пример: <code>SUMMER2024</code>", parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_promo_deactivate")
+def cb_admin_promo_deactivate(c):
+    uid = c.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(c.id, "❌ Нет доступа"); return
+    promo_admin_flow[uid] = {"step": "deactivate"}
+    bot.answer_callback_query(c.id)
+    bot.send_message(uid, "❌ Введите код промокода для деактивации:")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("promo_reward_"))
+def cb_promo_reward_type(c):
+    uid = c.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(c.id, "❌ Нет доступа"); return
+    if uid not in promo_admin_flow:
+        bot.answer_callback_query(c.id, "❌ Сессия не найдена"); return
+    reward_type = c.data.split("promo_reward_")[1]
+    promo_admin_flow[uid]["reward_type"] = reward_type
+    promo_admin_flow[uid]["step"] = "value"
+    bot.answer_callback_query(c.id)
+    try: bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
+    except Exception: pass
+    if reward_type == "coins":
+        bot.send_message(uid, "<b>Шаг 3/4</b> — Сколько монет выдавать?", parse_mode="HTML")
+    elif reward_type == "premium":
+        promo_admin_flow[uid]["reward_value"] = 0
+        promo_admin_flow[uid]["step"] = "max_uses"
+        bot.send_message(uid, "<b>Шаг 4/4</b> — Сколько раз можно использовать? (0 = неограничено)", parse_mode="HTML")
+    elif reward_type == "quals":
+        promo_admin_flow[uid]["reward_value"] = 0
+        promo_admin_flow[uid]["step"] = "max_uses"
+        bot.send_message(uid, "<b>Шаг 4/4</b> — Сколько раз можно использовать? (0 = неограничено)", parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.from_user.id in promo_admin_flow and m.text is not None)
+def handle_promo_admin_flow(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid): return
+    data = promo_admin_flow.get(uid, {})
+    step = data.get("step")
+    text = msg.text.strip()
+
+    if step == "code":
+        if not re.match(r'^[A-Za-z0-9]+$', text):
+            bot.send_message(uid, "❌ Только буквы и цифры. Попробуйте снова:"); return
+        data["code"] = text.upper()
+        data["step"] = "reward_type"
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("💰 Монеты", callback_data="promo_reward_coins"),
+            types.InlineKeyboardButton("👑 Premium", callback_data="promo_reward_premium"),
+            types.InlineKeyboardButton("⭐ Quals",   callback_data="promo_reward_quals"),
+        )
+        bot.send_message(uid, "<b>Шаг 2/4</b> — Выберите тип награды:", parse_mode="HTML", reply_markup=kb)
+
+    elif step == "value":
+        try: value = int(text)
+        except ValueError:
+            bot.send_message(uid, "❌ Введите число"); return
+        data["reward_value"] = value
+        data["step"] = "max_uses"
+        bot.send_message(uid, "<b>Шаг 4/4</b> — Сколько раз можно использовать? (0 = неограничено)", parse_mode="HTML")
+
+    elif step == "max_uses":
+        try: max_uses = int(text)
+        except ValueError:
+            bot.send_message(uid, "❌ Введите число"); return
+        code = data["code"]
+        reward_type = data["reward_type"]
+        reward_value = data.get("reward_value", 0)
+        promo_admin_flow.pop(uid, None)
+        ok = create_promo_code(code, reward_type, reward_value, max_uses)
+        if ok:
+            max_str = f"{max_uses}" if max_uses > 0 else "неограничено"
+            rtype_names = {"coins": f"💰 {reward_value} AC", "premium": "👑 Premium", "quals": "⭐ Quals"}
+            bot.send_message(uid,
+                f"✅ <b>Промокод создан!</b>\n\n"
+                f"Код: <code>{code}</code>\n"
+                f"Награда: {rtype_names.get(reward_type, reward_type)}\n"
+                f"Использований: {max_str}", parse_mode="HTML")
+        else:
+            bot.send_message(uid, f"❌ Промокод <code>{code}</code> уже существует!", parse_mode="HTML")
+
+    elif step == "deactivate":
+        promo_admin_flow.pop(uid, None)
+        deactivate_promo_code(text)
+        bot.send_message(uid, f"✅ Промокод <code>{text.upper()}</code> деактивирован.", parse_mode="HTML")
+
+
+# ==================== УПРАВЛЕНИЕ МАТЧАМИ (АДМИН) ====================
 @bot.callback_query_handler(func=lambda c: c.data == "admin_matches")
 def cb_admin_matches(c):
     uid = c.from_user.id
@@ -1968,7 +2371,8 @@ def cb_admin_players(c):
         uid2, name, elo, wins, losses, kills, deaths, coins, banned, warns = p
         ban_mark = " 🚫" if banned else ""
         warn_mark = f" ⚠️{warns}" if warns > 0 else ""
-        text += f"• <b>{name}</b>{ban_mark}{warn_mark} | ELO: {elo} | {wins}W/{losses}L\n"
+        prem = " 👑" if has_active_premium(uid2) else ""
+        text += f"• <b>{name}</b>{prem}{ban_mark}{warn_mark} | ELO: {elo} | {wins}W/{losses}L\n"
     if len(players) > 20: text += f"\n<i>...и ещё {len(players)-20}</i>"
     if not players: text += "Игроков нет."
     kb = types.InlineKeyboardMarkup()
@@ -2000,6 +2404,7 @@ def cb_admin_match_history(c):
     "admin_warn", "admin_ban", "admin_broadcast", "admin_give_admin",
     "admin_quals_access", "admin_give_game_reg", "admin_mute", "admin_unmute",
     "admin_check", "admin_uncheck", "admin_change_nick", "admin_change_gid",
+    "admin_edit_stats",
 ])
 def cb_admin_action(c):
     uid = c.from_user.id
@@ -2023,6 +2428,7 @@ def cb_admin_action(c):
         "unmute":         "🔊 Введите Telegram ID:",
         "check":          "🔎 Введите Telegram ID для вызова на проверку:",
         "uncheck":        "✅ Введите Telegram ID для снятия проверки:",
+        "edit_stats":     "📈 Введите Telegram ID игрока для редактирования статы:",
     }
     admin_action[uid] = {"action": action}
     bot.answer_callback_query(c.id)
@@ -2035,6 +2441,8 @@ def cb_admin_action(c):
     and m.from_user.id not in rename_flow
     and m.from_user.id not in match_registration
     and m.from_user.id not in change_flow
+    and m.from_user.id not in editstat_flow
+    and m.from_user.id not in promo_admin_flow
     and m.text is not None
 )
 def handle_admin_input(msg):
@@ -2044,7 +2452,6 @@ def handle_admin_input(msg):
     action = action_data.get("action", "")
     text = msg.text.strip()
 
-    # --- Поиск по нику/TG ID ---
     if action == "search":
         conn = _db(); cur = conn.cursor()
         if text.isdigit():
@@ -2059,12 +2466,12 @@ def handle_admin_input(msg):
             pid, name, game_id, elo, wins, losses, coins, banned, warns = r
             lvl = get_faceit_level(elo)
             check = "🔎 На проверке" if is_on_check_db(pid) else ""
-            result += (f"👤 <b>{name}</b> {check}\n  🆔 <code>{pid}</code> | Game ID: <code>{game_id}</code>\n"
+            prem = " 👑" if has_active_premium(pid) else ""
+            result += (f"👤 <b>{name}</b>{prem} {check}\n  🆔 <code>{pid}</code> | Game ID: <code>{game_id}</code>\n"
                        f"  ELO: {elo} [Lvl {lvl}] | {wins}W/{losses}L\n  💰 {coins} AC | ⚠️ {warns}/3\n"
                        f"  {'🚫 Забанен' if banned else '✅ Активен'}\n\n")
         bot.send_message(uid, result, parse_mode="HTML")
 
-    # --- Поиск по Game ID ---
     elif action == "search_gameid":
         p = get_player_by_game_id(text)
         if not p:
@@ -2072,13 +2479,38 @@ def handle_admin_input(msg):
         lvl = get_faceit_level(p[4])
         warns = p[15] if len(p) > 15 else 0
         check = "🔎 На проверке" if is_on_check_db(p[0]) else ""
-        result = (f"🔍 <b>Найден по Game ID: <code>{text}</code></b> {check}\n\n"
-                  f"👤 <b>{p[1]}</b>\n  🆔 <code>{p[0]}</code>\n  🎮 Game ID: <code>{p[2]}</code>\n"
+        prem = " 👑" if has_active_premium(p[0]) else ""
+        result = (f"🔍 <b>Найден по Game ID</b> {check}\n\n"
+                  f"👤 <b>{p[1]}</b>{prem}\n  🆔 <code>{p[0]}</code>\n  🎮 <code>{p[2]}</code>\n"
                   f"  ELO: {p[4]} [Lvl {lvl}] | {p[6]}W/{p[7]}L\n  💰 {p[5]} AC | ⚠️ {warns}/3\n"
                   f"  {'🚫 Забанен' if (len(p)>14 and p[14]) else '✅ Активен'}")
         bot.send_message(uid, result, parse_mode="HTML")
 
-    # --- Смена ника (шаг 1: получаем target_id) ---
+    elif action == "edit_stats":
+        try:
+            target_id = int(text)
+            p = get_player(target_id)
+            if not p:
+                bot.send_message(uid, "❌ Игрок не найден"); return
+            kb = types.InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                types.InlineKeyboardButton("🔫 Убийства",  callback_data=f"editstat_kills_{target_id}"),
+                types.InlineKeyboardButton("💀 Смерти",    callback_data=f"editstat_deaths_{target_id}"),
+                types.InlineKeyboardButton("🤝 Ассисты",   callback_data=f"editstat_assists_{target_id}"),
+                types.InlineKeyboardButton("🏆 Победы",    callback_data=f"editstat_wins_{target_id}"),
+                types.InlineKeyboardButton("❌ Поражения", callback_data=f"editstat_losses_{target_id}"),
+                types.InlineKeyboardButton("💰 Монеты",    callback_data=f"editstat_coins_{target_id}"),
+                types.InlineKeyboardButton("📊 ELO",       callback_data=f"editstat_elo_{target_id}"),
+            )
+            p_cur = get_player(target_id)
+            info = (f"📈 <b>Редактирование: {p[1]}</b>\n\n"
+                    f"🔫 Убийства: {p_cur[8]}\n💀 Смерти: {p_cur[9]}\n🤝 Ассисты: {p_cur[10]}\n"
+                    f"🏆 Победы: {p_cur[6]}\n❌ Поражения: {p_cur[7]}\n"
+                    f"📊 ELO: {p_cur[4]}\n💰 Монеты: {p_cur[5]}\n\nВыберите поле:")
+            bot.send_message(uid, info, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            bot.send_message(uid, "❌ Введите числовой Telegram ID")
+
     elif action == "change_nick":
         try:
             target_id = int(text)
@@ -2090,7 +2522,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Смена Game ID (шаг 1: получаем target_id) ---
     elif action == "change_gid":
         try:
             target_id = int(text)
@@ -2098,11 +2529,10 @@ def handle_admin_input(msg):
             if not p:
                 bot.send_message(uid, "❌ Игрок не найден"); return
             change_flow[uid] = {"field": "admin_id", "target_id": target_id}
-            bot.send_message(uid, f"🎮 Введите новый Game ID для <b>{p[1]}</b>:\n(только a-z, A-Z, 0-9, _, -)", parse_mode="HTML")
+            bot.send_message(uid, f"🎮 Введите новый Game ID для <b>{p[1]}</b>:", parse_mode="HTML")
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Выдать монеты ---
     elif action == "give_coins":
         try:
             parts = text.split(); target_id, amount = int(parts[0]), int(parts[1])
@@ -2117,7 +2547,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Формат: 123456789 500")
 
-    # --- Изменить ELO ---
     elif action == "set_elo":
         try:
             parts = text.split(); target_id, new_elo = int(parts[0]), int(parts[1])
@@ -2131,7 +2560,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Формат: 123456789 1500")
 
-    # --- Варн ---
     elif action == "warn":
         try:
             parts = text.split(maxsplit=1)
@@ -2152,7 +2580,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Формат: 123456789 Причина")
 
-    # --- Мут ---
     elif action == "mute":
         try:
             parts = text.split(); target_id = int(parts[0]); hours = int(parts[1]) if len(parts) > 1 else 2
@@ -2167,7 +2594,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Формат: 123456789 2")
 
-    # --- Размутить ---
     elif action == "unmute":
         try:
             target_id = int(text); p = get_player(target_id)
@@ -2180,27 +2606,21 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Вызвать на проверку ---
     elif action == "check":
         try:
             target_id = int(text); p = get_player(target_id)
             if not p:
                 bot.send_message(uid, "❌ Не найден"); return
             conn = _db(); conn.execute("UPDATE players SET is_on_check=1, check_admin_id=? WHERE user_id=?", (uid, target_id)); conn.commit(); conn.close()
-            # Сохраняем tg_username вызывающего
             if msg.from_user.username:
                 update_tg_username(uid, msg.from_user.username)
             admin_tg = msg.from_user.username or str(uid)
             bot.send_message(uid, f"🔎 <b>{p[1]}</b> вызван на проверку!", parse_mode="HTML")
-            try:
-                bot.send_message(target_id,
-                    f"⚠️ <b>Вас вызвал на проверку @{admin_tg}</b>\n\n"
-                    f"Доступ к боту ограничен.\nОбратитесь к администратору @{admin_tg}.")
+            try: bot.send_message(target_id, f"⚠️ <b>Вас вызвал на проверку @{admin_tg}</b>\n\nДоступ к боту ограничен.\nОбратитесь к @{admin_tg}.")
             except Exception: pass
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Снять проверку ---
     elif action == "uncheck":
         try:
             target_id = int(text); p = get_player(target_id)
@@ -2213,7 +2633,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Бан/Разбан ---
     elif action == "ban":
         try:
             target_id = int(text); p = get_player(target_id)
@@ -2234,7 +2653,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Выдать/снять админку ---
     elif action == "give_admin":
         try:
             target_id = int(text); p = get_player(target_id)
@@ -2249,7 +2667,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Роль Гейм Рег ---
     elif action == "give_game_reg":
         try:
             target_id = int(text); p = get_player(target_id)
@@ -2265,7 +2682,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Quals доступ ---
     elif action == "quals_access":
         try:
             target_id = int(text); p = get_player(target_id)
@@ -2281,7 +2697,6 @@ def handle_admin_input(msg):
         except Exception:
             bot.send_message(uid, "❌ Введите числовой Telegram ID")
 
-    # --- Рассылка ---
     elif action == "broadcast":
         players = get_all_players(); sent = failed = 0
         for player in players:
@@ -2322,7 +2737,7 @@ def cb_game_reg_panel(c):
     bot.answer_callback_query(c.id)
 
 
-# ==================== ПАТИ СИСТЕМА ====================
+# ==================== ПАТИ ====================
 @bot.callback_query_handler(func=lambda c: c.data == "party_menu")
 def cb_party_menu(c):
     uid = c.from_user.id
@@ -2348,7 +2763,7 @@ def _show_party(chat_id, msg_id, uid, party, edit=False):
     for m in members:
         p = get_player(m); name = p[1] if p else str(m)
         crown = " 👑" if m == leader else ""
-        prem = " ★" if has_active_premium(m) else ""
+        prem = " 👑" if has_active_premium(m) else ""
         text += f"• {name}{crown}{prem}\n"
     text += f"\n👤 {len(members)}/{max_size}"
     if max_size == 2: text += "\n💡 Premium расширяет до 3"
@@ -2413,7 +2828,7 @@ def handle_party_invite_id(msg):
     )
     try:
         bot.send_message(target_id, f"👥 <b>Приглашение в пати!</b>\nЛидер: <b>{leader_name}</b>\n{len(party['members'])}/{max_size}", reply_markup=kb)
-        bot.send_message(uid, f"✅ Приглашение отправлено", parse_mode="HTML")
+        bot.send_message(uid, "✅ Приглашение отправлено")
     except Exception:
         bot.send_message(uid, "❌ Не удалось отправить приглашение")
         party["invites"].pop(target_id, None)
@@ -2431,7 +2846,7 @@ def cb_party_accept(c):
         bot.answer_callback_query(c.id, "❌ Вы уже в другой пати", show_alert=True); return
     max_size = get_party_max_size(party)
     if len(party["members"]) >= max_size:
-        bot.answer_callback_query(c.id, f"❌ Пати полная!", show_alert=True); return
+        bot.answer_callback_query(c.id, "❌ Пати полная!", show_alert=True); return
     party["invites"].pop(uid, None); party["members"].append(uid); user_party[uid] = party_id
     p = get_player(uid); name = p[1] if p else str(uid)
     bot.answer_callback_query(c.id, "✅ Вы вступили!")
@@ -2501,5 +2916,5 @@ def _do_party_leave(uid):
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
     init_db()
-    print(f"✅ ACTUAL FACEIT Bot запущен! Админ: {ADMIN_ID}")
+    print(f"✅ ACTUAL FACEIT Bot запущен! Админы: {ADMIN_IDS_LIST}")
     bot.infinity_polling()
