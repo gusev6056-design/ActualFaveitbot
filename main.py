@@ -20,7 +20,8 @@ def health():
     return "Bot is running"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8099)
+    port = int(os.environ.get("PORT", 8099))
+    app.run(host="0.0.0.0", port=port)
 
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -3343,7 +3344,18 @@ def cb_game_reg_panel(c):
 
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
+    if not DATABASE_URL:
+        print("❌ ОШИБКА: Переменная DATABASE_URL не задана! Добавьте её в Environment Variables на Render.com")
+        exit(1)
+    if not TOKEN:
+        print("❌ ОШИБКА: Переменная BOT_TOKEN не задана! Добавьте её в Environment Variables на Render.com")
+        exit(1)
     print("🚀 Инициализация БД...")
-    init_db()
+    try:
+        init_db()
+        print("✅ БД инициализирована!")
+    except Exception as e:
+        print(f"❌ Ошибка инициализации БД: {e}")
+        exit(1)
     print("✅ Бот запущен!")
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
