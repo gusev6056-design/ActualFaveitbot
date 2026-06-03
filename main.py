@@ -3358,4 +3358,5 @@ if __name__ == "__main__":
         print(f"❌ Ошибка инициализации БД: {e}")
         exit(1)
     print("✅ Бот запущен!")
-    bot.infinity_polling(timeout=60, long_polling_timeout=30)
+    bot.infinity_polling(timeout=60,
+long_polling_timeout=30)
